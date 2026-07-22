@@ -1,0 +1,10 @@
+# Versões instaladas e compatíveis com Python 3.14
+# Nota: as versões originais da especificação (pandas 2.2.2, numpy 1.26.4, etc.)
+# não possuem wheels pré-compiladas para Python 3.14 e exigiriam MSVC.
+# As versões abaixo são funcionalmente equivalentes e possuem wheels disponíveis.
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+folium>=0.17
+matplotlib>=3.9
+joblib>=1.4
