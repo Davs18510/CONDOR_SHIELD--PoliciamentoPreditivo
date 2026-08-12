@@ -552,17 +552,29 @@ function renderHeatmap(keys, h){
   const grid = combineGrids(keys, h);
   const N = DATA.grid_n;
   const pts = [];
+  let maxV = 0;
   for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
-    if (grid[i][j] > 2.0) {  // Apenas passa pontos com densidade real > 2.0
-      pts.push([DATA.lat_arr[i], DATA.lon_arr[j], grid[i][j] / 100.0]);
+    if (grid[i][j] > maxV) maxV = grid[i][j];
+  }
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    if (grid[i][j] > 2.0) {
+      const normVal = maxV > 0 ? (grid[i][j] / maxV) : 0;
+      pts.push([DATA.lat_arr[i], DATA.lon_arr[j], normVal]);
     }
   }
   if (!pts.length) return;
   heatL = L.heatLayer(pts, {
-    radius: 20, blur: 15, minOpacity: 0.08, maxZoom: 16,
-    gradient: {0.15:'#1E3A8A', 0.35:'#0EA5E9', 0.55:'#10B981', 0.75:'#F59E0B', 1.0:'#EF4444'}
+    radius: 26, blur: 18, minOpacity: 0.12, maxZoom: 16, max: 0.45,
+    gradient: {
+      0.15: '#1E3A8A',
+      0.35: '#0EA5E9',
+      0.55: '#10B981',
+      0.75: '#F59E0B',
+      1.00: '#EF4444'
+    }
   }).addTo(map);
 }
+
 
 function renderZones(zones, assigns, activePredPts){
   const zu = {};
