@@ -1,0 +1,13 @@
+periodo,modelo,n_pct,precision_at_n,pai,ocorrencias_capturadas,total_real
+Validação Abr,XGBoost híbrido,0.1,0.3362,3.3621,39,116
+Validação Abr,KDE isolado,0.1,0.0948,0.9483,11,116
+Validação Abr,XGBoost híbrido,0.2,0.431,2.1552,50,116
+Validação Abr,KDE isolado,0.2,0.181,0.9052,21,116
+Validação Abr,XGBoost híbrido,0.3,0.5517,1.8391,64,116
+Validação Abr,KDE isolado,0.3,0.2586,0.8621,30,116
+Teste Mai,XGBoost híbrido,0.1,0.3494,3.494,29,83
+Teste Mai,KDE isolado,0.1,0.0602,0.6024,5,83
+Teste Mai,XGBoost híbrido,0.2,0.4337,2.1687,36,83
+Teste Mai,KDE isolado,0.2,0.1446,0.7229,12,83
+Teste Mai,XGBoost híbrido,0.3,0.4819,1.6064,40,83
+Teste Mai,KDE isolado,0.3,0.1928,0.6426,16,83
