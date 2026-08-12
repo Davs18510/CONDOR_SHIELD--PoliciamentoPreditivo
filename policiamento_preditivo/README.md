@@ -17,13 +17,15 @@ policiamento_preditivo/
 │       ├── grade_densidade.csv       ← grade 150×150 com scores KDE
 │       ├── metricas_avaliacao.csv    ← P@N e PAI para todos os limiares (KDE)
 │       ├── painel_delegacia_semana.csv ← NOVO: painel espaço-temporal (Etapa 7)
-│       └── metricas_hibrido.csv      ← NOVO: métricas comparativas KDE vs XGBoost (Etapa 9)
+│       ├── metricas_hibrido.csv      ← NOVO: métricas comparativas KDE vs XGBoost (Etapa 9)
+│       └── previsoes_xgboost_horizonte.json ← NOVO: previsões e pontos de crimes previstos (Etapa 10)
 ├── models/
 │   ├── kde_model.pkl                 ← modelo KDE serializado (prior espacial)
 │   └── xgboost_model.pkl             ← NOVO: modelo XGBoost Poisson (Etapa 8)
 ├── outputs/
 │   ├── mapa_risco_sp.html            ← ★ entregável principal
 │   ├── mapa_validacao_sp.html        ← comparação previsão vs. real
+│   ├── dashboard_preditivo.html      ← ★ SPA interativo com pontos previstos & viaturas
 │   └── relatorio_final.md            ← relatório com métricas
 ├── src/
 │   ├── 01_limpeza.py
@@ -31,10 +33,11 @@ policiamento_preditivo/
 │   ├── 03_treino_kde.py
 │   ├── 04_avaliacao.py
 │   ├── 05_visualizacao.py
-│   ├── 06_dashboard.py
+│   ├── 06_dashboard.py               ← gerador do SPA interativo com direcionamento de viaturas
 │   ├── 07_engenharia_temporal.py     ← NOVO: painel espaço-temporal delegacia x semana
 │   ├── 08_treino_xgboost.py          ← NOVO: treino supervisionado XGBoost Poisson
-│   └── 09_avaliacao_hibrida.py       ← NOVO: avaliação comparativa (KDE vs XGBoost)
+│   ├── 09_avaliacao_hibrida.py       ← NOVO: avaliação comparativa (KDE vs XGBoost)
+│   └── 10_previsao_multi_horizonte.py ← NOVO: rollout autorregressivo e pontos de crimes previstos
 ├── requirements.txt
 └── README.md
 ```
@@ -78,7 +81,14 @@ python src/08_treino_xgboost.py
 
 # Etapa 9: avaliação comparativa (KDE isolado vs. XGBoost Híbrido)
 python src/09_avaliacao_hibrida.py
+
+# Etapa 10: rollout autorregressivo e geração de pontos de crimes previstos
+python src/10_previsao_multi_horizonte.py
+
+# Etapa 6: compilação do dashboard preditivo interativo
+python src/06_dashboard.py
 ```
+
 
 
 Após a execução, abra no navegador:
