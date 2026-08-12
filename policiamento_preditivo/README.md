@@ -15,19 +15,29 @@ policiamento_preditivo/
 │       ├── df_validacao.csv          ← Abril 2026 (122 registros)
 │       ├── df_teste.csv              ← Maio 2026 (89 registros)
 │       ├── grade_densidade.csv       ← grade 150×150 com scores KDE
-│       └── metricas_avaliacao.csv    ← P@N e PAI para todos os limiares
+│       ├── metricas_avaliacao.csv    ← P@N e PAI para todos os limiares (KDE)
+│       ├── painel_delegacia_semana.csv ← NOVO: painel espaço-temporal (Etapa 7)
+│       ├── metricas_hibrido.csv      ← NOVO: métricas comparativas KDE vs XGBoost (Etapa 9)
+│       └── previsoes_xgboost_horizonte.json ← NOVO: previsões e pontos de crimes previstos (Etapa 10)
 ├── models/
-│   └── kde_model.pkl                 ← modelo KDE serializado
+│   ├── kde_model.pkl                 ← modelo KDE serializado (prior espacial)
+│   └── xgboost_model.pkl             ← NOVO: modelo XGBoost Poisson (Etapa 8)
 ├── outputs/
 │   ├── mapa_risco_sp.html            ← ★ entregável principal
 │   ├── mapa_validacao_sp.html        ← comparação previsão vs. real
+│   ├── dashboard_preditivo.html      ← ★ SPA interativo com pontos previstos & viaturas
 │   └── relatorio_final.md            ← relatório com métricas
 ├── src/
 │   ├── 01_limpeza.py
 │   ├── 02_engenharia_features.py
 │   ├── 03_treino_kde.py
 │   ├── 04_avaliacao.py
-│   └── 05_visualizacao.py
+│   ├── 05_visualizacao.py
+│   ├── 06_dashboard.py               ← gerador do SPA interativo com direcionamento de viaturas
+│   ├── 07_engenharia_temporal.py     ← NOVO: painel espaço-temporal delegacia x semana
+│   ├── 08_treino_xgboost.py          ← NOVO: treino supervisionado XGBoost Poisson
+│   ├── 09_avaliacao_hibrida.py       ← NOVO: avaliação comparativa (KDE vs XGBoost)
+│   └── 10_previsao_multi_horizonte.py ← NOVO: rollout autorregressivo e pontos de crimes previstos
 ├── requirements.txt
 └── README.md
 ```
@@ -62,7 +72,24 @@ python src/04_avaliacao.py
 
 # Etapa 5: geração dos mapas HTML interativos
 python src/05_visualizacao.py
+
+# Etapa 7: engenharia de features espaço-temporais (painel delegacia x semana)
+python src/07_engenharia_temporal.py
+
+# Etapa 8: treino do XGBoost com perda Poisson (regressão de contagem)
+python src/08_treino_xgboost.py
+
+# Etapa 9: avaliação comparativa (KDE isolado vs. XGBoost Híbrido)
+python src/09_avaliacao_hibrida.py
+
+# Etapa 10: rollout autorregressivo e geração de pontos de crimes previstos
+python src/10_previsao_multi_horizonte.py
+
+# Etapa 6: compilação do dashboard preditivo interativo
+python src/06_dashboard.py
 ```
+
+
 
 Após a execução, abra no navegador:
 
@@ -112,6 +139,22 @@ Após a execução, abra no navegador:
 4. **Split**: por mês (não aleatório) — treino Jan–Mar, validação Abr, teste Mai
 5. **Métricas**: Precision@N e PAI (Predictive Accuracy Index) em 3 limiares (10%, 20%, 30%)
 6. **Baseline**: KDE treinado somente em Março
+
+## Arquitetura do Modelo Híbrido (KDE + XGBoost Espaço-Temporal)
+
+O modelo híbrido estende o modelo KDE integrando dinâmicas temporais e supervisionadas:
+1. **Prior Espacial (KDE)**: O score de densidade estática obtido em `models/kde_model.pkl` para o centróide de cada delegacia serve como a feature `score_kde`.
+2. **Painel Espaço-Temporal (Delegacia × Semana)**: Agrupa os dados de ocorrências por delegacia de circunscrição e semana (`data/processed/painel_delegacia_semana.csv`), garantindo a inclusão explícita de semanas sem ocorrências (contagem zero).
+3. **Features Temporais e Lags**:
+   - `lag_1_semana`, `lag_2_semanas`: Ocorrências nas semanas anteriores.
+   - `media_4_semanas`, `media_8_semanas`: Média móvel de curto e médio prazo.
+   - `tendencia`: Variação entre a última semana e a anterior (`lag_1 - lag_2`).
+   - `MES`, `SEMANA_ANO`: Variáveis de calendário.
+4. **Regressão de Contagem (XGBoost Poisson)**:
+   - Objetivo: `count:poisson` com métrica `poisson-nloglik`.
+   - Adequado para distribuições de contagem esparsas (~85-90% de zeros).
+   - O modelo prediz a contagem esperada de ocorrências por delegacia/semana e é avaliado quanto ao PAI e Precision@N em relação ao KDE isolado.
+
 
 ## Decisões Éticas
 

@@ -1,10 +1,10 @@
 # =============================================================================
-# ETAPA 6 — DASHBOARD INTERATIVO DE POLICIAMENTO PREDITIVO
+# ETAPA 6 — DASHBOARD INTERATIVO DE POLICIAMENTO PREDITIVO HIBRIDO
 # =============================================================================
 # Gera outputs/dashboard_preditivo.html — aplicação SPA com:
-#   - Seleção de crimes, horizonte de previsão, nº de viaturas
-#   - Mapa Leaflet com heatmap KDE + zonas de patrulha
-#   - Sistema de direcionamento de viaturas (bairro, BPM, turno)
+#   - Previsão espaço-temporal XGBoost Poisson
+#   - Heatmap de densidade focado nos hotspots de crimes (sem manchas retangulares)
+#   - Direcionamento de viaturas distribuído pelos principais polos de risco
 # =============================================================================
 
 import pandas as pd
@@ -61,7 +61,7 @@ def kde_grid(pts_df):
     kde.fit(rad)
     d = np.exp(kde.score_samples(grade))
     d = (d - d.min()) / (d.max() - d.min() + 1e-12)
-    return (d.reshape(GRID_N, GRID_N) * 1000).round(1).tolist()
+    return (d.reshape(GRID_N, GRID_N) * 100).round(1).tolist()
 
 print('Calculando grades KDE por tipo de crime...')
 grids = {'all': kde_grid(coords)}
@@ -69,6 +69,61 @@ for ck in CRIME_KEYS:
     sub = coords[coords['NATUREZA APURADA'] == ck]
     print(f'  {CRIME_LABELS[ck]}: {len(sub)} pontos')
     grids[ck] = kde_grid(sub)
+
+# ── CARREGA PREVISOES MULTI-HORIZONTE (XGBOOST) ──────────────────────────────
+with open('data/processed/previsoes_xgboost_horizonte.json', encoding='utf-8') as f:
+    dados_xgb = json.load(f)
+
+probabilidades = dados_xgb['probabilidades']
+lambdas_mes    = dados_xgb['lambdas']
+pred_pts_por_h = dados_xgb['pred_pts']
+
+centroides = (
+    coords.groupby('NOME_DELEGACIA_CIRC')[['LATITUDE', 'LONGITUDE']]
+    .mean().reset_index()
+)
+lat_c = centroides['LATITUDE'].values
+lon_c = centroides['LONGITUDE'].values
+deleg_names = centroides['NOME_DELEGACIA_CIRC'].values
+
+# ── DENSIDADE GAUSSIANA ESPACIAL LOCALIZADA (SEM BLOB RETANGULAR) ────────────
+BANDWIDTH_KM = 1.8   # Raio de espalhamento focado nos centros de ocorrência
+lat_grid, lon_grid = np.meshgrid(lat_arr, lon_arr, indexing='ij')
+lat_flat = lat_grid.ravel()
+lon_flat = lon_grid.ravel()
+
+R_TERRA = 6371.0
+p1 = np.radians(lat_flat)[:, None]
+p2 = np.radians(lat_c)[None, :]
+dphi = np.radians(lat_c[None, :] - lat_flat[:, None])
+dl   = np.radians(lon_c[None, :] - lon_flat[:, None])
+a = np.sin(dphi/2)**2 + np.cos(p1)*np.cos(p2)*np.sin(dl/2)**2
+dist_km = 2 * R_TERRA * np.arcsin(np.sqrt(a))  # (3600, 95)
+
+# Kernel Gaussiano sem divisão por constante global
+pesos_gauss = np.exp(-(dist_km**2) / (2 * BANDWIDTH_KM**2))
+
+print('Gerando grades de densidade preditiva espacial por horizonte...')
+grids_horizonte = {}
+for h in [1, 2, 3, 4, 5, 6]:
+    # Pega o lambda de crimes esperados por delegacia para o mês h
+    lambdas_h = np.array([
+        lambdas_mes.get(d, {}).get(str(h), 0.0) for d in deleg_names
+    ])
+    
+    # Produto matricial: densidade não-normalizada de crimes por célula (3600,)
+    densidade_h = pesos_gauss @ lambdas_h
+    
+    # Normalização Min-Max para escala [0, 100] por horizonte
+    d_max = densidade_h.max()
+    d_min = densidade_h.min()
+    if d_max > d_min:
+        densidade_norm = ((densidade_h - d_min) / (d_max - d_min)) * 100.0
+    else:
+        densidade_norm = np.zeros_like(densidade_h)
+        
+    grid_h = densidade_norm.reshape(GRID_N, GRID_N)
+    grids_horizonte[str(h)] = grid_h.round(1).tolist()
 
 # ── PONTOS PARA DISPLAY ───────────────────────────────────────────────────────
 def pts_json(df, periodo):
@@ -91,23 +146,25 @@ turnos = df_tr['TURNO'].value_counts().to_dict() if 'TURNO' in df_tr.columns \
 tipo_counts = coords['NATUREZA APURADA'].value_counts().to_dict()
 
 DATA = {
-    'grids'       : grids,
-    'lat_arr'     : lat_arr.round(5).tolist(),
-    'lon_arr'     : lon_arr.round(5).tolist(),
-    'grid_n'      : GRID_N,
-    'treino_pts'  : pts_json(df_tr, 'treino'),
-    'val_pts'     : pts_json(df_va, 'val'),
-    'test_pts'    : pts_json(df_te, 'test'),
-    'metrics'     : {
+    'grids'           : grids,
+    'grids_horizonte' : grids_horizonte,
+    'pred_pts'        : pred_pts_por_h,
+    'lambdas'         : lambdas_mes,
+    'probabilidades'  : probabilidades,
+    'lat_arr'         : lat_arr.round(5).tolist(),
+    'lon_arr'         : lon_arr.round(5).tolist(),
+    'grid_n'          : GRID_N,
+    'treino_pts'      : pts_json(df_tr, 'treino'),
+    'val_pts'         : pts_json(df_va, 'val'),
+    'test_pts'        : pts_json(df_te, 'test'),
+    'metrics'         : {
         'n_treino': len(df_tr), 'n_coords': len(coords),
         'n_val': len(df_va),    'n_test': len(df_te),
-        'pai_10_abr': 3.91, 'pai_20_abr': 3.05,
-        'pai_10_mai': 4.74, 'pai_20_mai': 3.25,
     },
-    'turnos'      : turnos,
-    'tipo_counts' : tipo_counts,
-    'crime_keys'  : CRIME_KEYS,
-    'crime_labels': CRIME_LABELS,
+    'turnos'          : turnos,
+    'tipo_counts'     : tipo_counts,
+    'crime_keys'      : CRIME_KEYS,
+    'crime_labels'    : CRIME_LABELS,
 }
 
 data_js = 'const DATA = ' + json.dumps(DATA, ensure_ascii=False, separators=(',', ':')) + ';'
@@ -119,7 +176,7 @@ HEAD = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>PredPol SP - Sistema de Policiamento Preditivo</title>
+<title>PredPol SP - Policiamento Preditivo XGBoost</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
@@ -131,14 +188,14 @@ HEAD = '''<!DOCTYPE html>
 --red:#EF4444;--ora:#F97316;--yel:#EAB308;--grn:#10B981;
 --sw:280px;--pw:360px;}
 *{box-sizing:border-box;margin:0;padding:0;}
-html,body{height:100%;font-family:\'Inter\',sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;}
+html,body{height:100%;font-family:'Inter',sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;}
 #hdr{height:52px;background:linear-gradient(90deg,#060E22,#112046,#060E22);
   border-bottom:1px solid var(--bdr);display:flex;align-items:center;
   justify-content:space-between;padding:0 18px;position:relative;z-index:999;}
 .hdr-l{display:flex;align-items:center;gap:10px;}
 .hdr-l h1{font-size:14px;font-weight:800;letter-spacing:.02em;}
 .hdr-l h1 span{color:var(--bl);}
-.sim-badge{font-size:9px;font-weight:800;background:var(--red);color:#fff;
+.sim-badge{font-size:9px;font-weight:800;background:var(--blue);color:#fff;
   padding:2px 7px;border-radius:3px;letter-spacing:.1em;animation:pulse 2s infinite;}
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.7;}}
 .hdr-r{font-size:10px;color:var(--muted);text-align:right;line-height:1.7;}
@@ -183,6 +240,7 @@ select:focus{border-color:var(--blue);}
 .pcard.critico{border-left:3px solid var(--red);}
 .pcard.alto{border-left:3px solid var(--ora);}
 .pcard.medio{border-left:3px solid var(--yel);}
+.pcard.baixo{border-left:3px solid var(--blue);}
 .phdr{display:flex;align-items:center;gap:5px;margin-bottom:5px;flex-wrap:wrap;}
 .vnum{font-size:11px;font-weight:800;color:#fff;background:rgba(255,255,255,.1);
   padding:2px 7px;border-radius:4px;min-width:36px;text-align:center;}
@@ -192,61 +250,59 @@ select:focus{border-color:var(--blue);}
 .rbadge.CRITICO{background:rgba(239,68,68,.2);color:#FCA5A5;}
 .rbadge.ALTO{background:rgba(249,115,22,.2);color:#FDBA74;}
 .rbadge.MEDIO{background:rgba(234,179,8,.2);color:#FDE68A;}
+.rbadge.BAIXO{background:rgba(59,130,246,.2);color:#93C5FD;}
 .pbairro{font-size:12px;font-weight:600;color:#CBD5E1;margin-bottom:4px;}
 .pdet{font-size:10px;color:var(--muted);display:flex;flex-direction:column;gap:2px;line-height:1.5;}
 .mrow{display:flex;justify-content:space-between;align-items:center;
   padding:4px 0;border-bottom:1px solid rgba(255,255,255,.05);}
 .mrow:last-child{border-bottom:none;}
 .mkey{font-size:11px;color:var(--muted);}
-.mval{font-size:13px;font-weight:700;color:var(--bl);}
-.cbar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;overflow:hidden;margin:5px 0;}
-.cfill{height:100%;border-radius:3px;transition:width .6s ease;}
-.ibox{background:rgba(234,179,8,.07);border:1px solid rgba(234,179,8,.22);
-  border-radius:7px;padding:9px 10px;font-size:10px;color:#FDE68A;line-height:1.55;}
-.pp-hdr{padding-bottom:8px;border-bottom:1px solid var(--bdr);margin-bottom:4px;}
-.pp-title{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--bl);}
-.pp-sub{font-size:11px;color:var(--muted);margin-top:3px;}
-.chips{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px;}
-.chip{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.2);
-  border-radius:3px;padding:1px 6px;font-size:9px;color:var(--bl);}
-#map-overlay{position:absolute;top:10px;right:10px;z-index:500;
-  background:rgba(8,13,26,.88);border:1px solid var(--bdr);border-radius:8px;
-  padding:10px 12px;font-size:11px;line-height:1.8;min-width:160px;
-  backdrop-filter:blur(8px);}
-#map-overlay b{color:var(--bl);display:block;margin-bottom:4px;font-size:12px;}
-.leg-row{display:flex;align-items:center;gap:6px;}
-.leg-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0;}
-::-webkit-scrollbar{width:4px;}
-::-webkit-scrollbar-track{background:transparent;}
-::-webkit-scrollbar-thumb{background:rgba(59,130,246,.25);border-radius:2px;}
-.empty-state{text-align:center;color:var(--muted);padding:40px 16px;font-size:12px;line-height:1.7;}
-.empty-state b{color:var(--bl);display:block;margin-bottom:8px;font-size:14px;}
+.mval{font-size:11px;font-weight:700;color:var(--bl);}
+.pp-hdr{border-bottom:1px solid var(--bdr);padding-bottom:8px;}
+.pp-title{font-size:12px;font-weight:800;letter-spacing:.04em;}
+.pp-sub{font-size:10px;color:var(--muted);margin-top:2px;}
+.empty-state{text-align:center;padding:30px 10px;color:var(--muted);font-size:11px;line-height:1.6;}
+.empty-state b{color:var(--txt);display:block;margin-bottom:6px;font-size:13px;}
+#map-overlay{position:absolute;bottom:16px;left:16px;z-index:999;
+  background:rgba(8,13,26,.88);backdrop-filter:blur(8px);
+  border:1px solid var(--bdr);border-radius:8px;padding:9px 12px;
+  font-size:10px;line-height:1.6;}
+#map-overlay b{font-size:11px;color:var(--bl);display:block;margin-bottom:4px;}
+.leg-row{display:flex;align-items:center;gap:6px;color:var(--muted);}
+.leg-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.cbar{height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin:4px 0 6px;overflow:hidden;}
+.cfill{height:100%;border-radius:2px;transition:width .3s;}
+.ibox{background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.2);
+  border-radius:6px;padding:8px 10px;font-size:10px;color:var(--muted);line-height:1.5;}
 </style>
 </head>
 <body>
 <div id="hdr">
   <div class="hdr-l">
-    <span style="font-size:20px">🚔</span>
-    <h1><span>PredPol</span> SP &mdash; Sistema de Policiamento Preditivo</h1>
-    <span class="sim-badge">SIMULACAO</span>
+    <div style="width:28px;height:28px;background:linear-gradient(135deg,#2563EB,#1D4ED8);
+      border-radius:6px;display:flex;align-items:center;justify-content:center;
+      font-size:14px;font-weight:900;color:#fff;box-shadow:0 0 10px rgba(37,99,235,.5)">&#128737;</div>
+    <h1>PredPol <span>SP</span> &nbsp;<span style="font-weight:400;color:var(--muted);font-size:11px;">| Previsao XGBoost & Concentracao de Patrulha</span></h1>
+    <span class="sim-badge">XGBOOST ST</span>
   </div>
   <div class="hdr-r">
-    <div>SIPCV / SSP-SP &nbsp;&bull;&nbsp; Jan&ndash;Mar 2026</div>
-    <div>Modelo KDE Haversine &nbsp;&bull;&nbsp; <b>PAI max: 4.74</b></div>
+    Modelo: <b>XGBoost Poisson Hibrido</b> &nbsp;|&nbsp; Grade: <b>60&times;60</b> &nbsp;|&nbsp; Delegacias: <b>95</b><br>
+    Fonte: <b>SIPCV / SSP-SP</b> (Out 2025&ndash;Mai 2026)
   </div>
 </div>
 <div id="main">
   <div id="sidebar">
     <div class="panel">
-      <div class="ptitle">Tipos de Crime</div>
-      <div class="copt"><input type="checkbox" id="ck0" checked>
-        <label for="ck0">Tentativa de Homicidio</label></div>
-      <div class="copt"><input type="checkbox" id="ck1" checked>
-        <label for="ck1">Homicidio Doloso</label></div>
-      <div class="copt"><input type="checkbox" id="ck2" checked>
-        <label for="ck2">Lesao Corp. Seguida de Morte</label></div>
-      <div class="copt"><input type="checkbox" id="ck3" checked>
-        <label for="ck3">Latrocinio</label></div>
+      <div class="ptitle">Crimes Selecionados</div>
+      <div class="copt"><input type="checkbox" id="ck0" checked><label for="ck0">Tentativa de Homicidio</label></div>
+      <div class="copt"><input type="checkbox" id="ck1" checked><label for="ck1">Homicidio Doloso</label></div>
+      <div class="copt"><input type="checkbox" id="ck2" checked><label for="ck2">Lesao Corp. Seg. Morte</label></div>
+      <div class="copt"><input type="checkbox" id="ck3" checked><label for="ck3">Latrocinio</label></div>
+    </div>
+    <div class="panel">
+      <div class="ptitle">Camadas do Mapa</div>
+      <div class="copt"><input type="checkbox" id="chk-pred" checked><label for="chk-pred">&#128308; Pontos Previstos (XGBoost)</label></div>
+      <div class="copt"><input type="checkbox" id="chk-val" checked><label for="chk-val">&#9899; Ocorrencias Historicas Reais</label></div>
     </div>
     <div class="panel">
       <div class="ptitle">Horizonte de Previsao</div>
@@ -276,28 +332,28 @@ select:focus{border-color:var(--blue);}
     <button id="run-btn" onclick="runPrediction()">&#9654; EXECUTAR PREVISAO</button>
     <div class="panel" id="mpanel">
       <div class="ptitle">Metricas do Modelo</div>
-      <div id="mcontent"><div class="mrow"><span class="mkey">PAI (top 10%)</span>
-        <span class="mval">3.91</span></div>
-        <div class="mrow"><span class="mkey">Captacao (10% area)</span>
-        <span class="mval">39%</span></div>
-        <div class="mrow"><span class="mkey">Treino</span>
-        <span class="mval">Jan-Mar 2026</span></div></div>
+      <div id="mcontent">
+        <div class="mrow"><span class="mkey">Densidade Media nas Zonas</span><span class="mval">--</span></div>
+        <div class="mrow"><span class="mkey">Crimes Previstos no Mes</span><span class="mval">--</span></div>
+        <div class="mrow"><span class="mkey">Modelo</span><span class="mval">KDE + XGBoost</span></div>
+      </div>
     </div>
     <div class="ibox">
-      &#9888; Ferramenta de apoio a decisao. Nao substitui julgamento operacional.
-      Modelo treinado com dados de Jan-Mar 2026 &mdash; recomenda-se atualizacao periodica.
+      &#9888; As viaturas sao distribuídas estrategicamente para os focos de maior densidade de crimes previstos pelo XGBoost.
     </div>
   </div>
   <div id="mapbox">
     <div id="map"></div>
     <div id="map-overlay">
-      <b>Legenda</b>
-      <div class="leg-row"><div class="leg-dot" style="background:#EF4444"></div> Risco CRITICO</div>
-      <div class="leg-row"><div class="leg-dot" style="background:#F97316"></div> Risco ALTO</div>
-      <div class="leg-row"><div class="leg-dot" style="background:#EAB308"></div> Risco MEDIO</div>
-      <div class="leg-row" style="margin-top:6px"><div class="leg-dot"
-        style="background:linear-gradient(90deg,#1E40AF,#EF4444);border-radius:3px;width:24px;height:6px"></div>
-        &nbsp;Heatmap KDE</div>
+      <b>Legenda (Risco & Pontos Previstos)</b>
+      <div class="leg-row"><div class="leg-dot" style="background:#EF4444"></div> Risco CRITICO (&gt;75%)</div>
+      <div class="leg-row"><div class="leg-dot" style="background:#F97316"></div> Risco ALTO (50-75%)</div>
+      <div class="leg-row"><div class="leg-dot" style="background:#EAB308"></div> Risco MEDIO (25-50%)</div>
+      <div class="leg-row"><div class="leg-dot" style="background:#3B82F6"></div> Risco BAIXO (&lt;25%)</div>
+      <div class="leg-row" style="margin-top:4px"><div class="leg-dot" style="background:#F43F5E;border:1px solid #fff;"></div> &nbsp;Ponto de Crime Previsto (XGBoost)</div>
+      <div class="leg-row" style="margin-top:4px"><div class="leg-dot"
+        style="background:linear-gradient(90deg,#1E40AF,#10B981,#F59E0B,#EF4444);border-radius:3px;width:28px;height:6px"></div>
+        &nbsp;Densidade Preditiva de Ocorrencia</div>
     </div>
   </div>
   <div id="patrol">
@@ -314,7 +370,7 @@ select:focus{border-color:var(--blue);}
   </div>
 </div>
 <div id="ftr">
-  <span>Dados: SIPCV/SSP-SP (Out 2025&ndash;Mai 2026) &nbsp;|&nbsp; KDE Haversine (BW=0.003 rad ~19km) &nbsp;|&nbsp; Split: Jan-Mar treino / Abr validacao / Mai teste</span>
+  <span>Dados: SIPCV/SSP-SP &nbsp;|&nbsp; Previsao XGBoost Poisson &nbsp;|&nbsp; Direcionamento Preditivo de Patrulha</span>
   <span id="fstatus" style="color:var(--bl);font-weight:600;"></span>
 </div>
 <script>
@@ -343,12 +399,10 @@ const BAIRROS=[
 ];
 const PATROL_TYPES=['ROCAM/M','RPA','RPA','Forca Tatica','ROTAM','GCM','RPA','CHOQUE'];
 const BPMS=['1o BPM/M (Se)','5o BPM/M (Bras)','7o BPM/M (Ipiranga)','8o BPM/M (Pinheiros)',
-  '12o BPM/M (S.Mateus)','13o BPM/M (Santana)','14o BPM/M (Tatua pe)','15o BPM/M (Jabaquara)',
+  '12o BPM/M (S.Mateus)','13o BPM/M (Santana)','14o BPM/M (Tatuape)','15o BPM/M (Jabaquara)',
   '17o BPM/M (C.Limpo)','19o BPM/M (Guarulhos)','21o BPM/M (Pirituba)','23o BPM/M (Itaquera)',
   '24o BPM/M (Guaianazes)','27o BPM/M (Diadema)','37o BPM/M (Osasco)'];
-const RCOLS={CRITICO:'#EF4444',ALTO:'#F97316',MEDIO:'#EAB308'};
-const CONF={1:85,2:78,3:62,4:48,5:38,6:30};
-const PAI_EST={1:3.91,2:4.74,3:3.2,4:2.5,5:1.9,6:1.5};
+const RCOLS={CRITICO:'#EF4444',ALTO:'#F97316',MEDIO:'#EAB308',BAIXO:'#3B82F6'};
 const MONTHS=['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
 
 // ── MAP SETUP ─────────────────────────────────────────────────────────────────
@@ -358,12 +412,12 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{
   subdomains:'abcd',maxZoom:18
 }).addTo(map);
 
-let heatL=null,zoneL=[],markL=[],routeL=[];
+let heatL=null,zoneL=[],markL=[],routeL=[],predL=[];
 
 function clearLayers(){
   if(heatL){map.removeLayer(heatL);heatL=null;}
-  [...zoneL,...markL,...routeL].forEach(l=>map.removeLayer(l));
-  zoneL=[];markL=[];routeL=[];
+  [...zoneL,...markL,...routeL,...predL].forEach(l=>map.removeLayer(l));
+  zoneL=[];markL=[];routeL=[];predL=[];
 }
 
 // ── UTILITIES ─────────────────────────────────────────────────────────────────
@@ -391,148 +445,193 @@ function getSelectedKeys(){
   return keys;
 }
 
-// ── GRID LOGIC ────────────────────────────────────────────────────────────────
-function combineGrids(keys){
-  const N=DATA.grid_n;
-  const out=Array.from({length:N},()=>new Float32Array(N));
-  const active=keys.length?keys:['all'];
-  for(const k of active){
-    const g=DATA.grids[k]||DATA.grids['all'];
-    for(let i=0;i<N;i++) for(let j=0;j<N;j++) out[i][j]+=g[i][j];
+// ── COMBINE DENSITY GRIDS FOR HORIZON H ───────────────────────────────────────
+function combineGrids(keys, h){
+  const N = DATA.grid_n;
+  const gridH = DATA.grids_horizonte[String(h)] || DATA.grids_horizonte['1'];
+  
+  if (keys.length === 4) return gridH;
+  
+  // Se tipos específicos de crime foram marcados, filtra pela forma KDE histórica
+  const shape = (keys.length === 1 && DATA.grids[keys[0]])
+    ? DATA.grids[keys[0]]
+    : DATA.grids['all'];
+
+  let sMax = 0;
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++)
+    if (shape[i][j] > sMax) sMax = shape[i][j];
+
+  const out = Array.from({length: N}, () => new Float32Array(N));
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    const w = sMax > 0 ? (0.3 + 0.7 * (shape[i][j] / sMax)) : 1.0;
+    out[i][j] = gridH[i][j] * w;
   }
-  let mx=0;
-  for(let i=0;i<N;i++) for(let j=0;j<N;j++) if(out[i][j]>mx) mx=out[i][j];
-  if(mx>0) for(let i=0;i<N;i++) for(let j=0;j<N;j++) out[i][j]=out[i][j]/mx*1000;
   return out;
 }
 
-function findZones(grid,hFactor){
-  const N=DATA.grid_n;
-  const cells=[];
-  let flat=[];
-  for(let i=0;i<N;i++) for(let j=0;j<N;j++) flat.push(grid[i][j]);
-  flat.sort((a,b)=>b-a);
-  const thr=flat[Math.floor(flat.length*0.08)];
-  for(let i=0;i<N;i++)
-    for(let j=0;j<N;j++)
-      if(grid[i][j]>=thr)
-        cells.push({lat:DATA.lat_arr[i],lon:DATA.lon_arr[j],d:grid[i][j],i,j});
-  cells.sort((a,b)=>b.d-a.d);
-  const R=0.032*Math.max(1,hFactor);
-  const zones=[],used=new Set();
-  for(const c of cells){
-    const key=c.i+','+c.j;
-    if(used.has(key)) continue;
-    const mems=[c]; used.add(key);
-    for(const o of cells){
-      if(used.has(o.i+','+o.j)) continue;
-      if(Math.hypot(c.lat-o.lat,c.lon-o.lon)<=R){mems.push(o);used.add(o.i+','+o.j);}
+// ── REDISTRIBUIÇÃO DE VIATURAS POR NON-MAXIMUM SUPPRESSION (NMS) ──────────────
+function findZones(grid, hFactor){
+  const N = DATA.grid_n;
+  const cells = [];
+  
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      if (grid[i][j] > 15.0) {  // Seleciona apenas células de densidade relevante
+        cells.push({
+          lat: DATA.lat_arr[i],
+          lon: DATA.lon_arr[j],
+          d: grid[i][j],
+          i, j
+        });
+      }
     }
-    let wLat=0,wLon=0,wS=0;
-    for(const m of mems){wLat+=m.lat*m.d;wLon+=m.lon*m.d;wS+=m.d;}
-    zones.push({lat:wLat/wS,lon:wLon/wS,totD:wS,maxD:c.d,sz:mems.length,
-      radM:Math.max(600,Math.round(R*111000*Math.max(1,hFactor*0.8)))});
-    if(zones.length>=12) break;
   }
-  zones.sort((a,b)=>b.totD-a.totD);
+  cells.sort((a, b) => b.d - a.d);
+
+  const MIN_DIST = 0.035;  // Distância mínima em graus (~3.8 km) para separar zonas distintas
+  const zones = [];
+  
+  for (const c of cells) {
+    // Verifica se a célula já está próxima de uma zona existente
+    let nearExist = false;
+    for (const z of zones) {
+      if (Math.hypot(c.lat - z.lat, c.lon - z.lon) < MIN_DIST) {
+        nearExist = true;
+        break;
+      }
+    }
+    if (!nearExist) {
+      zones.push({
+        lat: c.lat,
+        lon: c.lon,
+        totD: c.d,
+        maxD: c.d,
+        radM: Math.round(1400 * Math.max(0.8, hFactor))
+      });
+    }
+    if (zones.length >= 15) break;
+  }
+  
+  zones.sort((a, b) => b.maxD - a.maxD);
   return zones;
 }
 
-function assignUnits(zones,nUnits,pType){
-  if(!zones.length) return [];
-  const assigns=[];
-  for(let u=0;u<nUnits;u++){
-    const zi=u%zones.length;
-    const z=zones[zi];
-    const rp=z.maxD/1000;
-    const risk=rp>0.65?'CRITICO':rp>0.35?'ALTO':'MEDIO';
-    const bairro=nearestBairro(z.lat,z.lon);
-    const ut=pType!=='AUTO'?pType:PATROL_TYPES[u%PATROL_TYPES.length];
-    const bpm=BPMS[zi%BPMS.length];
-    const tos=DATA.turnos;
-    const maxT=Object.entries(tos).sort((a,b)=>b[1]-a[1])[0][0];
-    const tStr={noite:'18h-23h (pico noturno)',manha:'06h-12h (pico matutino)',
+function assignUnits(zones, nUnits, pType){
+  if (!zones.length) return [];
+  const assigns = [];
+  for (let u = 0; u < nUnits; u++) {
+    const zi = u % zones.length;
+    const z = zones[zi];
+    const densPct = z.maxD;
+    const risk = densPct > 75 ? 'CRITICO' : densPct > 50 ? 'ALTO' : densPct > 25 ? 'MEDIO' : 'BAIXO';
+    const bairro = nearestBairro(z.lat, z.lon);
+    const ut = pType !== 'AUTO' ? pType : PATROL_TYPES[u % PATROL_TYPES.length];
+    const bpm = BPMS[zi % BPMS.length];
+    const tos = DATA.turnos;
+    const maxT = Object.entries(tos).sort((a,b)=>b[1]-a[1])[0][0];
+    const tStr = {noite:'18h-23h (pico noturno)',manha:'06h-12h (pico matutino)',
       tarde:'12h-18h (pico vespertino)',madrugada:'00h-05h (madrugada)'}[maxT]||'18h-23h';
-    assigns.push({num:u+1,zone:z,risk,bairro,ut,bpm,tStr,zi,coords:[z.lat,z.lon]});
+      
+    assigns.push({
+      num: u + 1,
+      zone: z,
+      risk,
+      bairro,
+      ut,
+      bpm,
+      tStr,
+      zi,
+      coords: [z.lat, z.lon]
+    });
   }
   return assigns;
 }
 
 // ── MAP RENDERING ─────────────────────────────────────────────────────────────
-function renderHeatmap(keys){
-  let pts=DATA.treino_pts;
-  if(keys.length) pts=pts.filter(p=>keys.includes(p.tipo));
-  if(!pts.length) return;
-  heatL=L.heatLayer(pts.map(p=>[p.lat,p.lon,1.0]),{
-    radius:22,blur:14,minOpacity:0.4,maxZoom:16,
-    gradient:{0.25:'#1E3A8A',0.5:'#0EA5E9',0.72:'#10B981',0.87:'#F59E0B',1.0:'#EF4444'}
+function renderHeatmap(keys, h){
+  const grid = combineGrids(keys, h);
+  const N = DATA.grid_n;
+  const pts = [];
+  let maxV = 0;
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    if (grid[i][j] > maxV) maxV = grid[i][j];
+  }
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    if (grid[i][j] > 2.0) {
+      const normVal = maxV > 0 ? (grid[i][j] / maxV) : 0;
+      pts.push([DATA.lat_arr[i], DATA.lon_arr[j], normVal]);
+    }
+  }
+  if (!pts.length) return;
+  heatL = L.heatLayer(pts, {
+    radius: 26, blur: 18, minOpacity: 0.12, maxZoom: 16, max: 0.45,
+    gradient: {
+      0.15: '#1E3A8A',
+      0.35: '#0EA5E9',
+      0.55: '#10B981',
+      0.75: '#F59E0B',
+      1.00: '#EF4444'
+    }
   }).addTo(map);
 }
 
-function renderZones(zones,assigns){
-  // Build zone->units map
-  const zu={};
-  for(const a of assigns){
-    if(!zu[a.zi]) zu[a.zi]={z:a.zone,risk:a.risk,bairro:a.bairro,units:[]};
+
+function renderZones(zones, assigns, activePredPts){
+  const zu = {};
+  for (const a of assigns) {
+    if (!zu[a.zi]) zu[a.zi] = {z: a.zone, risk: a.risk, bairro: a.bairro, units: []};
     zu[a.zi].units.push(a);
   }
-  for(const [zi,zd] of Object.entries(zu)){
-    const col=RCOLS[zd.risk];
-    const circle=L.circle([zd.z.lat,zd.z.lon],{
-      radius:zd.z.radM,color:col,fillColor:col,fillOpacity:0.1,
-      weight:2,dashArray:'6,3'
+  for (const [zi, zd] of Object.entries(zu)) {
+    const col = RCOLS[zd.risk];
+    const circle = L.circle([zd.z.lat, zd.z.lon], {
+      radius: zd.z.radM, color: col, fillColor: col, fillOpacity: 0.12,
+      weight: 2, dashArray: '6,3'
     }).addTo(map);
-    const popBody=zd.units.map(u=>`<b>V${String(u.num).padStart(2,'0')}</b> ${u.ut}`).join('<br>');
+    
+    const popBody = zd.units.map(u => `<b>V${String(u.num).padStart(2,'0')}</b> ${u.ut}`).join('<br>');
     circle.bindPopup(`<div style="font-family:sans-serif;font-size:12px">
-      <b style="color:${col}">${zd.bairro}</b><br>Risco: ${zd.risk}<br><br>${popBody}</div>`);
+      <b style="color:${col}">${zd.bairro}</b><br>Foco Preditivo: ${zd.risk} (${zd.z.maxD.toFixed(1)}% densidade)<br><br>${popBody}</div>`);
     zoneL.push(circle);
 
-    // Markers (grouped per zone)
-    const lbl=zd.units.length>1?zd.units.length+'V':'V'+String(zd.units[0].num).padStart(2,'0');
-    const icon=L.divIcon({
-      html:`<div style="background:${col};color:#fff;border-radius:50%;width:34px;height:34px;
+    const lbl = zd.units.length > 1 ? zd.units.length + 'V' : 'V' + String(zd.units[0].num).padStart(2,'0');
+    const icon = L.divIcon({
+      html: `<div style="background:${col};color:#fff;border-radius:50%;width:34px;height:34px;
         display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;
-        border:2px solid rgba(255,255,255,.55);box-shadow:0 2px 10px rgba(0,0,0,.6);
+        border:2px solid rgba(255,255,255,.65);box-shadow:0 3px 12px rgba(0,0,0,.7);
         font-family:Inter,sans-serif">${lbl}</div>`,
-      className:'',iconSize:[34,34],iconAnchor:[17,17]
+      className: '', iconSize: [34, 34], iconAnchor: [17, 17]
     });
-    const mk=L.marker([zd.z.lat,zd.z.lon],{icon}).addTo(map);
+    const mk = L.marker([zd.z.lat, zd.z.lon], {icon}).addTo(map);
     mk.bindPopup(`<div style="font-family:sans-serif;font-size:12px">
-      <b>${zd.bairro}</b><br>${popBody}</div>`);
+      <b>${zd.bairro}</b><br>Foco Preditivo: ${zd.risk} (${zd.z.maxD.toFixed(1)}%)<br><br>${popBody}</div>`);
     markL.push(mk);
 
-    // Patrol route star: center -> nearby training pts
-    const near=DATA.treino_pts.filter(p=>Math.hypot(p.lat-zd.z.lat,p.lon-zd.z.lon)<0.025).slice(0,6);
-    for(const np of near){
-      const rl=L.polyline([[zd.z.lat,zd.z.lon],[np.lat,np.lon]],
-        {color:col,weight:1.2,opacity:0.35,dashArray:'3,4'}).addTo(map);
+    // Conecta a viatura aos pontos de ocorrência previstos mais próximos na zona
+    const nearPred = activePredPts.filter(p => Math.hypot(p.lat - zd.z.lat, p.lon - zd.z.lon) < 0.04).slice(0, 6);
+    for (const np of nearPred) {
+      const rl = L.polyline([[zd.z.lat, zd.z.lon], [np.lat, np.lon]],
+        {color: col, weight: 1.5, opacity: 0.5, dashArray: '3,4'}).addTo(map);
       routeL.push(rl);
     }
   }
 }
 
 // ── PATROL PANEL ──────────────────────────────────────────────────────────────
-function renderPatrolPanel(assigns,h){
-  const conf=CONF[h]||30;
-  const target=getTargetMonth(h);
-  const confCol=conf>70?'#10B981':conf>50?'#F59E0B':'#EF4444';
+function renderPatrolPanel(assigns, h){
+  const target = getTargetMonth(h);
+  document.getElementById('pp-sub').textContent = 'Previsao XGBoost para ' + target + ' | ' + assigns.length + ' viaturas';
 
-  document.getElementById('pp-sub').textContent='Previsao para '+target+' | '+assigns.length+' viaturas';
-
-  // Confidence block
-  let html=`<div class="panel" style="margin-bottom:6px">
-    <div class="ptitle">Confianca da Previsao</div>
-    <div style="font-size:20px;font-weight:800;color:${confCol}">${conf}%</div>
-    <div class="cbar"><div class="cfill" style="width:${conf}%;background:${confCol}"></div></div>
+  let html = `<div class="panel" style="margin-bottom:6px">
+    <div class="ptitle">Direcionamento Preditivo XGBoost</div>
+    <div style="font-size:12px;font-weight:600;color:var(--bl);margin-bottom:4px">Foco em Hotspots de Maior Concentracao</div>
     <div style="font-size:10px;color:var(--muted)">Horizonte: +${h} mes(es) | Alvo: ${target}</div>
-    ${h>=3?'<div style="font-size:10px;color:#F59E0B;margin-top:5px">&#9888; Previsao extrapolada. Atualizar modelo com dados recentes.</div>':''}
   </div>`;
 
-  // Unit cards
-  for(const a of assigns){
-    const rc=a.risk.toLowerCase();
-    const rl={CRITICO:'CRITICO',ALTO:'ALTO',MEDIO:'MEDIO'}[a.risk];
-    html+=`<div class="pcard ${rc}" onclick="focusZone(${a.zone.lat},${a.zone.lon},${a.zone.radM})">
+  for (const a of assigns) {
+    const rc = a.risk.toLowerCase();
+    const rl = {CRITICO:'CRITICO',ALTO:'ALTO',MEDIO:'MEDIO',BAIXO:'BAIXO'}[a.risk];
+    html += `<div class="pcard ${rc}" onclick="focusZone(${a.zone.lat},${a.zone.lon},${a.zone.radM})">
       <div class="phdr">
         <span class="vnum">V${String(a.num).padStart(2,'0')}</span>
         <span class="utype">${a.ut}</span>
@@ -540,94 +639,120 @@ function renderPatrolPanel(assigns,h){
       </div>
       <div class="pbairro">&#128205; ${a.bairro}</div>
       <div class="pdet">
+        <span>&#128202; Densidade no Hotspot: <b>${a.zone.maxD.toFixed(1)}%</b></span>
         <span>&#127963; ${a.bpm}</span>
-        <span>&#8987; Foco: ${a.tStr}</span>
-        <span>&#128204; ${a.zone.lat.toFixed(4)}, ${a.zone.lon.toFixed(4)}</span>
-        <span>&#128308; Zona ${a.zi+1} de ${Math.min(assigns.length,12)}</span>
+        <span>&#8987; Horario Recomendado: ${a.tStr}</span>
+        <span>&#128204; Coordenadas: ${a.zone.lat.toFixed(4)}, ${a.zone.lon.toFixed(4)}</span>
+        <span>&#128308; Polo ${a.zi+1} de ${Math.min(assigns.length, 12)}</span>
       </div>
     </div>`;
   }
-  document.getElementById('plist').innerHTML=html;
+  document.getElementById('plist').innerHTML = html;
 }
 
 // ── METRICS PANEL ─────────────────────────────────────────────────────────────
-function updateMetrics(keys,assigns,h){
-  const pai=PAI_EST[h]||1.5;
-  const conf=CONF[h]||30;
-  const nPts=keys.length?DATA.treino_pts.filter(p=>keys.includes(p.tipo)).length:DATA.treino_pts.length;
-  const cap=Math.round((pai*10));
-  document.getElementById('mcontent').innerHTML=`
-    <div class="mrow"><span class="mkey">PAI estimado</span><span class="mval">${pai.toFixed(2)}</span></div>
-    <div class="mrow"><span class="mkey">Captacao (10% area)</span><span class="mval">~${Math.min(99,cap)}%</span></div>
-    <div class="mrow"><span class="mkey">Confianca</span><span class="mval">${conf}%</span></div>
-    <div class="mrow"><span class="mkey">Pontos de treino</span><span class="mval">${nPts}</span></div>
-    <div class="mrow"><span class="mkey">Viaturas</span><span class="mval">${assigns.length}</span></div>
-    <div class="mrow"><span class="mkey">Zonas detectadas</span><span class="mval">${Math.min(assigns.length,12)}</span></div>
+function updateMetrics(keys, assigns, h, totalPredPts){
+  const probsVisiveis = assigns.map(a => a.zone.maxD);
+  const probMedia = probsVisiveis.length
+    ? (probsVisiveis.reduce((s,v)=>s+v,0) / probsVisiveis.length) : 0;
+  document.getElementById('mcontent').innerHTML = `
+    <div class="mrow"><span class="mkey">Densidade Media nas Zonas</span><span class="mval">${probMedia.toFixed(1)}%</span></div>
+    <div class="mrow"><span class="mkey">Pontos Previstos (XGBoost)</span><span class="mval">${totalPredPts}</span></div>
+    <div class="mrow"><span class="mkey">Horizonte</span><span class="mval">+${h} mes(es)</span></div>
+    <div class="mrow"><span class="mkey">Polos de Atuacao</span><span class="mval">${Math.min(assigns.length, 12)}</span></div>
+    <div class="mrow"><span class="mkey">Viaturas Alocadas</span><span class="mval">${assigns.length}</span></div>
   `;
 }
 
 // ── FOCUS MAP ─────────────────────────────────────────────────────────────────
-function focusZone(lat,lon,radM){
-  const zoom=radM>2000?12:radM>1000?13:14;
-  map.flyTo([lat,lon],zoom,{duration:1.0});
+function focusZone(lat, lon, radM){
+  const zoom = radM > 2000 ? 12 : radM > 1000 ? 13 : 14;
+  map.flyTo([lat, lon], zoom, {duration: 1.0});
 }
 
 // ── MAIN RUN ──────────────────────────────────────────────────────────────────
 function runPrediction(){
-  const btn=document.getElementById('run-btn');
-  btn.textContent='Calculando...';btn.disabled=true;
-  setTimeout(()=>{
-    const keys=getSelectedKeys();
-    const h=parseInt(document.getElementById('hslider').value);
-    const n=parseInt(document.getElementById('uslider').value);
-    const pt=document.getElementById('psel').value;
-    const hF=1+(h-1)*0.22;
+  const btn = document.getElementById('run-btn');
+  btn.textContent = 'Calculando...'; btn.disabled = true;
+  setTimeout(() => {
+    const keys = getSelectedKeys();
+    const h = parseInt(document.getElementById('hslider').value);
+    const n = parseInt(document.getElementById('uslider').value);
+    const pt = document.getElementById('psel').value;
+    const showPredPts = document.getElementById('chk-pred').checked;
+    const showValPts = document.getElementById('chk-val').checked;
+    const hF = 1 + (h - 1) * 0.15;
 
-    const grid=combineGrids(keys);
-    const zones=findZones(grid,hF);
-    const assigns=assignUnits(zones,n,pt);
+    const grid = combineGrids(keys, h);
+    const zones = findZones(grid, hF);
+    const assigns = assignUnits(zones, n, pt);
 
     clearLayers();
-    renderHeatmap(keys);
-    renderZones(zones,assigns);
-    renderPatrolPanel(assigns,h);
-    updateMetrics(keys,assigns,h);
+    renderHeatmap(keys, h);
 
-    // Val/test pts toggle layer (always shown as small gray dots)
-    const valPts=[...DATA.val_pts,...DATA.test_pts];
-    const vKeys=keys.length?keys:DATA.crime_keys;
-    const vf=valPts.filter(p=>vKeys.includes(p.tipo));
-    if(vf.length){
-      const vLayer=L.layerGroup();
-      for(const p of vf){
-        L.circleMarker([p.lat,p.lon],{radius:3,color:'#94A3B8',fillColor:'#94A3B8',
-          fillOpacity:.5,weight:0}).bindPopup(
-          `<div style="font-size:11px;font-family:sans-serif"><b>${p.tipo}</b><br>${p.data}<br>${p.local}</div>`
-        ).addTo(vLayer);
+    // Pontos de Crimes Previstos (XGBoost)
+    const rawPredPts = DATA.pred_pts[String(h)] || [];
+    const vKeys = keys.length ? keys : DATA.crime_keys;
+    const activePredPts = rawPredPts.filter(p => vKeys.includes(p.tipo));
+
+    if (showPredPts && activePredPts.length) {
+      for (const p of activePredPts) {
+        const mk = L.circleMarker([p.lat, p.lon], {
+          radius: 5, color: '#F43F5E', fillColor: '#F43F5E',
+          fillOpacity: 0.85, weight: 1.5
+        }).bindPopup(
+          `<div style="font-size:11px;font-family:sans-serif">
+            <b style="color:#E11D48">&#9888; Crime Previsto (XGBoost)</b><br>
+            <b>${p.tipo}</b><br>
+            Delegacia: ${p.deleg}<br>
+            Expectativa: ${p.lambda} crimes/mes<br>
+            Probabilidade: ${p.prob}%
+          </div>`
+        ).addTo(map);
+        predL.push(mk);
       }
-      vLayer.addTo(map);
-      markL.push(vLayer);
     }
 
-    const target=getTargetMonth(h);
-    document.getElementById('fstatus').textContent=
-      'Previsao para '+target+' | '+assigns.length+' viaturas | Confianca '+CONF[h]+'%';
+    renderZones(zones, assigns, activePredPts);
+    renderPatrolPanel(assigns, h);
+    updateMetrics(keys, assigns, h, activePredPts.length);
 
-    btn.textContent='\\u25b6 EXECUTAR PREVISAO';btn.disabled=false;
-  },80);
+    // Ocorrências Históricas Reais (opcional)
+    if (showValPts) {
+      const valPts = [...DATA.val_pts, ...DATA.test_pts];
+      const vf = valPts.filter(p => vKeys.includes(p.tipo));
+      if (vf.length) {
+        const vLayer = L.layerGroup();
+        for (const p of vf) {
+          L.circleMarker([p.lat, p.lon], {radius: 3, color: '#64748B', fillColor: '#64748B',
+            fillOpacity: .5, weight: 0}).bindPopup(
+            `<div style="font-size:11px;font-family:sans-serif"><b>${p.tipo}</b> (Historico)<br>${p.data}<br>${p.local}</div>`
+          ).addTo(vLayer);
+        }
+        vLayer.addTo(map);
+        markL.push(vLayer);
+      }
+    }
+
+    const target = getTargetMonth(h);
+    document.getElementById('fstatus').textContent =
+      'Previsao para ' + target + ' | ' + assigns.length + ' viaturas direcionadas aos hotspots de risco';
+
+    btn.textContent = '\\u25b6 EXECUTAR PREVISAO'; btn.disabled = false;
+  }, 80);
 }
 
 // ── EVENT LISTENERS ───────────────────────────────────────────────────────────
-document.getElementById('hslider').addEventListener('input',e=>{
-  document.getElementById('hv').textContent=e.target.value;
-  document.getElementById('htarget').textContent='Alvo: '+getTargetMonth(e.target.value);
+document.getElementById('hslider').addEventListener('input', e => {
+  document.getElementById('hv').textContent = e.target.value;
+  document.getElementById('htarget').textContent = 'Alvo: ' + getTargetMonth(e.target.value);
 });
-document.getElementById('uslider').addEventListener('input',e=>{
-  document.getElementById('uv').textContent=e.target.value;
+document.getElementById('uslider').addEventListener('input', e => {
+  document.getElementById('uv').textContent = e.target.value;
 });
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
-document.getElementById('htarget').textContent='Alvo: '+getTargetMonth(1);
+document.getElementById('htarget').textContent = 'Alvo: ' + getTargetMonth(1);
 runPrediction();
 </script>
 </body>
