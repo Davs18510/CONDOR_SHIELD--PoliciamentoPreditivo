@@ -182,36 +182,37 @@
     <div class="container">
         <header>
             <h1>Condor Shield</h1>
-            <p class="subtitle">Modelo de Policiamento Preditivo utilizando Kernel Density Estimation para estimativa espacial de risco de crimes contra a vida na cidade de São Paulo.</p>
+            <p class="subtitle">Modelo Híbrido de Policiamento Preditivo (KDE + XGBoost Espaço-Temporal) para estimativa de risco de crimes contra a vida na cidade de São Paulo, geração de pontos previstos e direcionamento automático de viaturas.</p>
         </header>
 
         <div class="grid">
             <a href="policiamento_preditivo/outputs/dashboard_preditivo.html" class="card">
                 <div class="card-icon">📊</div>
-                <h2 class="card-title">Dashboard Preditivo</h2>
-                <p class="card-desc">Visão geral interativa com gráficos e métricas sobre a distribuição e previsão de ocorrências.</p>
-                <div class="card-action">Acessar Dashboard <span>→</span></div>
+                <h2 class="card-title">Dashboard Preditivo XGBoost</h2>
+                <p class="card-desc">SPA interativo com mapa de calor focado, pontos de crimes previstos pelo XGBoost, slider de horizonte (1-6 meses) e direcionamento preditivo de viaturas.</p>
+                <div class="card-action">Acessar Dashboard Preditivo <span>→</span></div>
             </a>
 
             <a href="policiamento_preditivo/outputs/mapa_risco_sp.html" class="card">
                 <div class="card-icon">🗺️</div>
-                <h2 class="card-title">Mapa de Risco (KDE)</h2>
-                <p class="card-desc">Visualização geoespacial principal do modelo, destacando as áreas de maior densidade criminal.</p>
+                <h2 class="card-title">Mapa de Risco Espacial (KDE)</h2>
+                <p class="card-desc">Visualização geoespacial com densidade Kernel (prior espacial do modelo híbrido), destacando as áreas de maior incidência criminal.</p>
                 <div class="card-action">Explorar Mapa <span>→</span></div>
             </a>
 
             <a href="policiamento_preditivo/outputs/mapa_validacao_sp.html" class="card">
                 <div class="card-icon">✅</div>
                 <h2 class="card-title">Mapa de Validação</h2>
-                <p class="card-desc">Comparação entre as previsões do modelo e as ocorrências reais registradas no período de validação.</p>
+                <p class="card-desc">Comparação entre as previsões do modelo e as ocorrências reais registradas no período de validação e teste.</p>
                 <div class="card-action">Ver Validação <span>→</span></div>
             </a>
         </div>
     </div>
 
     <footer>
-        <p>Projeto acadêmico — Condor Shield. Desenvolvido com dados reais da SSP-SP (SIPCV/SPVida).</p>
+        <p>Projeto acadêmico — Condor Shield. Desenvolvido com dados reais da SSP-SP (SIPCV/SPVida) | Modelo Híbrido KDE + XGBoost Espaço-Temporal.</p>
     </footer>
+
 
 </body>
 </html>
