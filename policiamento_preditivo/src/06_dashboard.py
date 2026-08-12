@@ -4,6 +4,7 @@
 # Gera outputs/dashboard_preditivo.html — aplicação SPA com:
 #   - Previsão espaço-temporal XGBoost Poisson
 #   - Heatmap de densidade focado nos hotspots de crimes (sem manchas retangulares)
+#   - Atualização LIVE em tempo real ao mover o slider de horizonte (1-6 meses)
 #   - Direcionamento de viaturas distribuído pelos principais polos de risco
 # =============================================================================
 
@@ -86,7 +87,7 @@ lat_c = centroides['LATITUDE'].values
 lon_c = centroides['LONGITUDE'].values
 deleg_names = centroides['NOME_DELEGACIA_CIRC'].values
 
-# ── DENSIDADE GAUSSIANA ESPACIAL LOCALIZADA (SEM BLOB RETANGULAR) ────────────
+# ── DENSIDADE GAUSSIANA ESPACIAL LOCALIZADA COM ESCALA DINÂMICA ──────────────
 BANDWIDTH_KM = 1.8   # Raio de espalhamento focado nos centros de ocorrência
 lat_grid, lon_grid = np.meshgrid(lat_arr, lon_arr, indexing='ij')
 lat_flat = lat_grid.ravel()
@@ -100,29 +101,25 @@ dl   = np.radians(lon_c[None, :] - lon_flat[:, None])
 a = np.sin(dphi/2)**2 + np.cos(p1)*np.cos(p2)*np.sin(dl/2)**2
 dist_km = 2 * R_TERRA * np.arcsin(np.sqrt(a))  # (3600, 95)
 
-# Kernel Gaussiano sem divisão por constante global
 pesos_gauss = np.exp(-(dist_km**2) / (2 * BANDWIDTH_KM**2))
 
 print('Gerando grades de densidade preditiva espacial por horizonte...')
-grids_horizonte = {}
+densidades_brutas = {}
+max_global = 1e-9
 for h in [1, 2, 3, 4, 5, 6]:
-    # Pega o lambda de crimes esperados por delegacia para o mês h
     lambdas_h = np.array([
         lambdas_mes.get(d, {}).get(str(h), 0.0) for d in deleg_names
     ])
-    
-    # Produto matricial: densidade não-normalizada de crimes por célula (3600,)
-    densidade_h = pesos_gauss @ lambdas_h
-    
-    # Normalização Min-Max para escala [0, 100] por horizonte
-    d_max = densidade_h.max()
-    d_min = densidade_h.min()
-    if d_max > d_min:
-        densidade_norm = ((densidade_h - d_min) / (d_max - d_min)) * 100.0
-    else:
-        densidade_norm = np.zeros_like(densidade_h)
-        
-    grid_h = densidade_norm.reshape(GRID_N, GRID_N)
+    d_h = pesos_gauss @ lambdas_h
+    densidades_brutas[str(h)] = d_h
+    if d_h.max() > max_global:
+        max_global = d_h.max()
+
+grids_horizonte = {}
+for h in [1, 2, 3, 4, 5, 6]:
+    # Preserva as diferenças dinâmicas entre os meses escalando pelo máximo global
+    d_norm = (densidades_brutas[str(h)] / max_global) * 100.0
+    grid_h = d_norm.reshape(GRID_N, GRID_N)
     grids_horizonte[str(h)] = grid_h.round(1).tolist()
 
 # ── PONTOS PARA DISPLAY ───────────────────────────────────────────────────────
@@ -476,7 +473,7 @@ function findZones(grid, hFactor){
   
   for (let i = 0; i < N; i++) {
     for (let j = 0; j < N; j++) {
-      if (grid[i][j] > 15.0) {  // Seleciona apenas células de densidade relevante
+      if (grid[i][j] > 10.0) {  // Seleciona células com densidade preditiva relevante
         cells.push({
           lat: DATA.lat_arr[i],
           lon: DATA.lon_arr[j],
@@ -492,7 +489,6 @@ function findZones(grid, hFactor){
   const zones = [];
   
   for (const c of cells) {
-    // Verifica se a célula já está próxima de uma zona existente
     let nearExist = false;
     for (const z of zones) {
       if (Math.hypot(c.lat - z.lat, c.lon - z.lon) < MIN_DIST) {
@@ -574,7 +570,6 @@ function renderHeatmap(keys, h){
     }
   }).addTo(map);
 }
-
 
 function renderZones(zones, assigns, activePredPts){
   const zu = {};
@@ -671,10 +666,8 @@ function focusZone(lat, lon, radM){
 }
 
 // ── MAIN RUN ──────────────────────────────────────────────────────────────────
-function runPrediction(){
-  const btn = document.getElementById('run-btn');
-  btn.textContent = 'Calculando...'; btn.disabled = true;
-  setTimeout(() => {
+function runPrediction(fast = false){
+  const execute = () => {
     const keys = getSelectedKeys();
     const h = parseInt(document.getElementById('hslider').value);
     const n = parseInt(document.getElementById('uslider').value);
@@ -738,22 +731,47 @@ function runPrediction(){
     document.getElementById('fstatus').textContent =
       'Previsao para ' + target + ' | ' + assigns.length + ' viaturas direcionadas aos hotspots de risco';
 
-    btn.textContent = '\\u25b6 EXECUTAR PREVISAO'; btn.disabled = false;
-  }, 80);
+    const btn = document.getElementById('run-btn');
+    if (btn) { btn.textContent = '\\u25b6 EXECUTAR PREVISAO'; btn.disabled = false; }
+  };
+
+  if (fast) {
+    execute();
+  } else {
+    const btn = document.getElementById('run-btn');
+    if (btn) { btn.textContent = 'Calculando...'; btn.disabled = true; }
+    setTimeout(execute, 40);
+  }
 }
 
-// ── EVENT LISTENERS ───────────────────────────────────────────────────────────
+// ── EVENT LISTENERS (REATIVIDADE LIVE EM TEMPO REAL) ──────────────────────────
+function triggerUpdateFast(){
+  runPrediction(true);
+}
+
 document.getElementById('hslider').addEventListener('input', e => {
   document.getElementById('hv').textContent = e.target.value;
   document.getElementById('htarget').textContent = 'Alvo: ' + getTargetMonth(e.target.value);
+  triggerUpdateFast();
 });
+
 document.getElementById('uslider').addEventListener('input', e => {
   document.getElementById('uv').textContent = e.target.value;
+  triggerUpdateFast();
 });
+
+document.getElementById('psel').addEventListener('change', triggerUpdateFast);
+document.getElementById('chk-pred').addEventListener('change', triggerUpdateFast);
+document.getElementById('chk-val').addEventListener('change', triggerUpdateFast);
+
+for (let i = 0; i < 4; i++) {
+  const ck = document.getElementById('ck' + i);
+  if (ck) ck.addEventListener('change', triggerUpdateFast);
+}
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 document.getElementById('htarget').textContent = 'Alvo: ' + getTargetMonth(1);
-runPrediction();
+runPrediction(true);
 </script>
 </body>
 </html>'''
