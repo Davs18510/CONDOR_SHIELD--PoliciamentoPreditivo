@@ -3,9 +3,9 @@
 # =============================================================================
 # Gera outputs/dashboard_preditivo.html — aplicação SPA com:
 #   - Previsão espaço-temporal XGBoost Poisson
-#   - Heatmap de densidade focado nos hotspots de crimes (sem manchas retangulares)
-#   - Atualização LIVE em tempo real ao mover o slider de horizonte (1-6 meses)
-#   - Direcionamento de viaturas distribuído pelos principais polos de risco
+#   - Heatmap de densidade 100% fidedigno aos pontos de crimes previstos
+#   - Atualização automática live ao alterar qualquer controle/slider
+#   - Direcionamento de viaturas alinhado aos picos de ocorrências previstas
 # =============================================================================
 
 import pandas as pd
@@ -79,46 +79,47 @@ probabilidades = dados_xgb['probabilidades']
 lambdas_mes    = dados_xgb['lambdas']
 pred_pts_por_h = dados_xgb['pred_pts']
 
-centroides = (
-    coords.groupby('NOME_DELEGACIA_CIRC')[['LATITUDE', 'LONGITUDE']]
-    .mean().reset_index()
-)
-lat_c = centroides['LATITUDE'].values
-lon_c = centroides['LONGITUDE'].values
-deleg_names = centroides['NOME_DELEGACIA_CIRC'].values
+# ── DENSIDADE ESPACIAL 100% FIDEDIGNA AOS PONTOS DE CRIMES PREVISTOS ─────────
+# Calcula o kernel Gaussiano de cada horizonte H a partir das coordenadas
+# EXATAS dos pontos em pred_pts, garantindo que o heatmap esteja perfeitamente
+# alinhado aos pontos previstos pelo XGBoost.
+BANDWIDTH_KM = 1.5
+R_TERRA = 6371.0
 
-# ── DENSIDADE GAUSSIANA ESPACIAL LOCALIZADA COM ESCALA DINÂMICA ──────────────
-BANDWIDTH_KM = 1.8   # Raio de espalhamento focado nos centros de ocorrência
 lat_grid, lon_grid = np.meshgrid(lat_arr, lon_arr, indexing='ij')
 lat_flat = lat_grid.ravel()
 lon_flat = lon_grid.ravel()
 
-R_TERRA = 6371.0
-p1 = np.radians(lat_flat)[:, None]
-p2 = np.radians(lat_c)[None, :]
-dphi = np.radians(lat_c[None, :] - lat_flat[:, None])
-dl   = np.radians(lon_c[None, :] - lon_flat[:, None])
-a = np.sin(dphi/2)**2 + np.cos(p1)*np.cos(p2)*np.sin(dl/2)**2
-dist_km = 2 * R_TERRA * np.arcsin(np.sqrt(a))  # (3600, 95)
-
-pesos_gauss = np.exp(-(dist_km**2) / (2 * BANDWIDTH_KM**2))
-
-print('Gerando grades de densidade preditiva espacial por horizonte...')
+print('Gerando grades de densidade preditiva fidedignas aos pontos de crimes previstos...')
 densidades_brutas = {}
 max_global = 1e-9
+
 for h in [1, 2, 3, 4, 5, 6]:
-    lambdas_h = np.array([
-        lambdas_mes.get(d, {}).get(str(h), 0.0) for d in deleg_names
-    ])
-    d_h = pesos_gauss @ lambdas_h
+    pts_h = pred_pts_por_h.get(str(h), [])
+    if not pts_h:
+        densidades_brutas[str(h)] = np.zeros(GRID_N * GRID_N)
+        continue
+    
+    lats_p = np.array([p['lat'] for p in pts_h])
+    lons_p = np.array([p['lon'] for p in pts_h])
+    
+    p1 = np.radians(lat_flat)[:, None]                # (3600, 1)
+    p2 = np.radians(lats_p)[None, :]                  # (1, M)
+    dphi = np.radians(lats_p[None, :] - lat_flat[:, None])
+    dl   = np.radians(lons_p[None, :] - lon_flat[:, None])
+    a = np.sin(dphi/2)**2 + np.cos(p1)*np.cos(p2)*np.sin(dl/2)**2
+    dist_km = 2 * R_TERRA * np.arcsin(np.sqrt(a))      # (3600, M)
+    
+    # Soma dos kernels Gaussianos sobre as coordenadas exatas dos pontos previstos
+    d_h = np.exp(-(dist_km**2) / (2 * BANDWIDTH_KM**2)).sum(axis=1) # (3600,)
     densidades_brutas[str(h)] = d_h
     if d_h.max() > max_global:
         max_global = d_h.max()
 
 grids_horizonte = {}
 for h in [1, 2, 3, 4, 5, 6]:
-    # Preserva as diferenças dinâmicas entre os meses escalando pelo máximo global
-    d_norm = (densidades_brutas[str(h)] / max_global) * 100.0
+    d_h = densidades_brutas.get(str(h), np.zeros(GRID_N * GRID_N))
+    d_norm = (d_h / max_global) * 100.0
     grid_h = d_norm.reshape(GRID_N, GRID_N)
     grids_horizonte[str(h)] = grid_h.round(1).tolist()
 
@@ -473,7 +474,7 @@ function findZones(grid, hFactor){
   
   for (let i = 0; i < N; i++) {
     for (let j = 0; j < N; j++) {
-      if (grid[i][j] > 10.0) {  // Seleciona células com densidade preditiva relevante
+      if (grid[i][j] > 5.0) {  // Seleciona células com densidade preditiva relevante
         cells.push({
           lat: DATA.lat_arr[i],
           lon: DATA.lon_arr[j],
@@ -543,7 +544,7 @@ function assignUnits(zones, nUnits, pType){
   return assigns;
 }
 
-// ── MAP RENDERING ─────────────────────────────────────────────────────────────
+// ── MAP RENDERING FIDEDIGNO AOS PONTOS DE PREVISÃO ────────────────────────────
 function renderHeatmap(keys, h){
   const grid = combineGrids(keys, h);
   const N = DATA.grid_n;
@@ -553,14 +554,14 @@ function renderHeatmap(keys, h){
     if (grid[i][j] > maxV) maxV = grid[i][j];
   }
   for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
-    if (grid[i][j] > 2.0) {
+    if (grid[i][j] > 1.0) {
       const normVal = maxV > 0 ? (grid[i][j] / maxV) : 0;
       pts.push([DATA.lat_arr[i], DATA.lon_arr[j], normVal]);
     }
   }
   if (!pts.length) return;
   heatL = L.heatLayer(pts, {
-    radius: 26, blur: 18, minOpacity: 0.12, maxZoom: 16, max: 0.45,
+    radius: 24, blur: 16, minOpacity: 0.10, maxZoom: 16, max: 0.40,
     gradient: {
       0.15: '#1E3A8A',
       0.35: '#0EA5E9',
